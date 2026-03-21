@@ -56,36 +56,40 @@
     },
     {
       "parameters": {
-        "model": "claude-sonnet-4-20250514",
-        "messages": {
-          "values": [
+        "url": "https://api.minimax.io/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
             {
-              "role": "system",
-              "content": "You are a commit triage assistant for a private fork of the mem0 repository. Your job is to review cherry-pick candidates and confirm which ones should be applied.\n\nThe fork uses these components:\n- mem0/ (core Python SDK) - ALWAYS relevant\n- openmemory/ (self-hosted MCP server) - ALWAYS relevant\n- server/ (REST API server) - relevant\n- synaptic_memory/ (custom addition) - our code, upstream won't have this\n\nFor each candidate, respond with APPROVE or SKIP and a brief reason.\n\nPrioritize:\n- Bug fixes (especially in LLM connectors, vector stores, memory operations)\n- Security fixes\n- Feature additions to core SDK or openmemory\n\nSkip:\n- Version bumps with no code changes\n- Documentation-only changes\n- CI/CD workflow changes\n- Changes only to embedchain/ or openclaw/\n- TypeScript SDK changes (unless they fix shared logic)"
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.MINIMAX_API_KEY }}"
             },
             {
-              "role": "user",
-              "content": "=Review these upstream commits for cherry-picking into our private fork:\n\nPre-approved by heuristics ({{ $json.approved_count }}):\n{{ JSON.stringify($json.candidates, null, 2) }}\n\nBorderline - need your judgement ({{ $json.borderline_count }}):\n{{ JSON.stringify($json.borderline, null, 2) }}\n\nRespond with a JSON array of {sha, verdict: \"approve\"|\"skip\", reason} for ALL commits listed above."
+              "name": "Content-Type",
+              "value": "application/json"
             }
           ]
         },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'MiniMax-M2.7', temperature: 0, max_tokens: 2000, messages: [ { role: 'system', content: 'You are a commit triage assistant for a private fork of the mem0 repository. Your job is to review cherry-pick candidates and confirm which ones should be applied.\\n\\nThe fork uses these components:\\n- mem0/ (core Python SDK) - ALWAYS relevant\\n- openmemory/ (self-hosted MCP server) - ALWAYS relevant\\n- server/ (REST API server) - relevant\\n- synaptic_memory/ (custom addition) - our code, upstream won\\'t have this\\n\\nFor each candidate, respond with APPROVE or SKIP and a brief reason.\\n\\nPrioritize:\\n- Bug fixes (especially in LLM connectors, vector stores, memory operations)\\n- Security fixes\\n- Feature additions to core SDK or openmemory\\n\\nSkip:\\n- Version bumps with no code changes\\n- Documentation-only changes\\n- CI/CD workflow changes\\n- Changes only to embedchain/ or openclaw/\\n- TypeScript SDK changes (unless they fix shared logic)' }, { role: 'user', content: 'Review these upstream commits for cherry-picking into our private fork:\\n\\nPre-approved by heuristics (' + $json.approved_count + '):\\n' + JSON.stringify($json.candidates, null, 2) + '\\n\\nBorderline - need your judgement (' + $json.borderline_count + '):\\n' + JSON.stringify($json.borderline, null, 2) + '\\n\\nRespond with a JSON array of {sha, verdict: \"approve\"|\"skip\", reason} for ALL commits listed above.' } ] }) }}",
         "options": {
-          "temperature": 0,
-          "maxTokens": 2000
+          "response": {
+            "response": {
+              "responseFormat": "autodetect"
+            }
+          }
         }
       },
       "id": "ai-review",
-      "name": "AI Commit Review",
-      "type": "@n8n/n8n-nodes-langchain.lmChatAnthropic",
-      "typeVersion": 1.4,
-      "position": [1100, 200],
-      "credentials": {
-        "anthropicApi": { "id": "anthropic-api", "name": "Anthropic API" }
-      }
+      "name": "AI Commit Review (MiniMax)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 200]
     },
     {
       "parameters": {
-        "jsCode": "const aiResponse = $input.first().json.message?.content || $input.first().json.text || '{}';\n\n// Parse AI verdicts\nlet verdicts;\ntry {\n  // Extract JSON from response (may be wrapped in markdown)\n  const match = aiResponse.match(/\\[[\\s\\S]*\\]/);\n  verdicts = match ? JSON.parse(match[0]) : [];\n} catch (e) {\n  // If AI response isn't parseable, fall back to heuristic approvals only\n  verdicts = [];\n}\n\nconst previous = $('Parse Results').first().json;\nconst approved = new Set();\n\n// Heuristic approvals that AI confirmed or didn't override\nfor (const c of previous.candidates) {\n  const aiVerdict = verdicts.find(v => v.sha === c.sha);\n  if (!aiVerdict || aiVerdict.verdict === 'approve') {\n    approved.add(c.full_sha);\n  }\n}\n\n// Borderline that AI approved\nfor (const v of verdicts) {\n  if (v.verdict === 'approve') {\n    const borderline = previous.borderline.find(b => b.sha === v.sha);\n    if (borderline) approved.add(borderline.full_sha);\n  }\n}\n\nreturn [{\n  json: {\n    approved_shas: [...approved],\n    approved_count: approved.size,\n    upstream_head: previous.upstream_head,\n    since: previous.since,\n    verdicts\n  }\n}];"
+        "jsCode": "const body = $input.first().json;\nconst aiResponse = body?.choices?.[0]?.message?.content || '{}';\n\n// Parse AI verdicts\nlet verdicts;\ntry {\n  // Extract JSON from response (may be wrapped in markdown)\n  const match = aiResponse.match(/\\[[\\s\\S]*\\]/);\n  verdicts = match ? JSON.parse(match[0]) : [];\n} catch (e) {\n  // If AI response isn't parseable, fall back to heuristic approvals only\n  verdicts = [];\n}\n\nconst previous = $('Parse Results').first().json;\nconst approved = new Set();\n\n// Heuristic approvals that AI confirmed or didn't override\nfor (const c of previous.candidates) {\n  const aiVerdict = verdicts.find(v => v.sha === c.sha);\n  if (!aiVerdict || aiVerdict.verdict === 'approve') {\n    approved.add(c.full_sha);\n  }\n}\n\n// Borderline that AI approved\nfor (const v of verdicts) {\n  if (v.verdict === 'approve') {\n    const borderline = previous.borderline.find(b => b.sha === v.sha);\n    if (borderline) approved.add(borderline.full_sha);\n  }\n}\n\nreturn [{\n  json: {\n    approved_shas: [...approved],\n    approved_count: approved.size,\n    upstream_head: previous.upstream_head,\n    since: previous.since,\n    verdicts\n  }\n}];"
       },
       "id": "build-pick-list",
       "name": "Build Pick List",
@@ -149,11 +153,11 @@
     "Parse Results": { "main": [[{ "node": "Has Candidates?", "type": "main", "index": 0 }]] },
     "Has Candidates?": {
       "main": [
-        [{ "node": "AI Commit Review", "type": "main", "index": 0 }],
+        [{ "node": "AI Commit Review (MiniMax)", "type": "main", "index": 0 }],
         [{ "node": "No Action Needed", "type": "main", "index": 0 }]
       ]
     },
-    "AI Commit Review": { "main": [[{ "node": "Build Pick List", "type": "main", "index": 0 }]] },
+    "AI Commit Review (MiniMax)": { "main": [[{ "node": "Build Pick List", "type": "main", "index": 0 }]] },
     "Build Pick List": { "main": [[{ "node": "Any Approved?", "type": "main", "index": 0 }]] },
     "Any Approved?": {
       "main": [
