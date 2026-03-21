@@ -172,6 +172,7 @@ logger = logging.getLogger(__name__)
 class Memory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
+        self.default_user_id = config.default_user_id
 
         self.custom_fact_extraction_prompt = self.config.custom_fact_extraction_prompt
         self.custom_update_memory_prompt = self.config.custom_update_memory_prompt
@@ -204,6 +205,13 @@ class Memory(MemoryBase):
             self.enable_graph = True
         else:
             self.graph = None
+
+        if self.config.enable_synaptic:
+            logger.warning(
+                "enable_synaptic=True has no effect on the sync Memory class. "
+                "Use AsyncMemory for synaptic memory support."
+            )
+
         # Create telemetry config manually to avoid deepcopy issues with thread locks
         telemetry_config_dict = {}
         if hasattr(self.config.vector_store.config, 'model_dump'):
@@ -327,6 +335,8 @@ class Memory(MemoryBase):
             LLMError: If LLM operations fail.
             DatabaseError: If database operations fail.
         """
+
+        user_id = user_id or self.default_user_id
 
         processed_metadata, effective_filters = _build_filters_and_metadata(
             user_id=user_id,
@@ -677,6 +687,7 @@ class Memory(MemoryBase):
                   it might return a direct list (see deprecation warning).
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", ...}]}`
         """
+        user_id = user_id or self.default_user_id
 
         _, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_filters=filters
@@ -799,6 +810,8 @@ class Memory(MemoryBase):
                   and potentially "relations" if graph store is enabled.
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}`
         """
+        user_id = user_id or self.default_user_id
+
         _, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_filters=filters
         )
@@ -1031,6 +1044,7 @@ class Memory(MemoryBase):
             agent_id (str, optional): ID of the agent to delete memories for. Defaults to None.
             run_id (str, optional): ID of the run to delete memories for. Defaults to None.
         """
+        user_id = user_id or self.default_user_id
         filters: Dict[str, Any] = {}
         if user_id:
             filters["user_id"] = user_id
@@ -1241,6 +1255,7 @@ class Memory(MemoryBase):
 class AsyncMemory(MemoryBase):
     def __init__(self, config: MemoryConfig = MemoryConfig()):
         self.config = config
+        self.default_user_id = config.default_user_id
 
         self.embedding_model = EmbedderFactory.create(
             self.config.embedder.provider,
@@ -1272,6 +1287,11 @@ class AsyncMemory(MemoryBase):
         else:
             self.graph = None
 
+        self._synaptic = None
+        if self.config.enable_synaptic:
+            from mem0.memory.synaptic_bridge import SynapticBridge
+            self._synaptic = SynapticBridge(db_dir=self.config.synaptic_db_dir)
+
         telemetry_config = _safe_deepcopy_config(self.config.vector_store.config)
         telemetry_config.collection_name = "mem0migrations"
         if self.config.vector_store.provider in ["faiss", "qdrant"]:
@@ -1279,7 +1299,6 @@ class AsyncMemory(MemoryBase):
             telemetry_config.path = os.path.join(mem0_dir, provider_path)
             os.makedirs(telemetry_config.path, exist_ok=True)
         self._telemetry_vector_store = VectorStoreFactory.create(self.config.vector_store.provider, telemetry_config)
-
         capture_event("mem0.init", self, {"sync_type": "async"})
 
     @classmethod
@@ -1358,6 +1377,8 @@ class AsyncMemory(MemoryBase):
         Returns:
             dict: A dictionary containing the result of the memory addition operation.
         """
+        user_id = user_id or self.default_user_id
+
         processed_metadata, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_metadata=metadata
         )
@@ -1518,6 +1539,7 @@ class AsyncMemory(MemoryBase):
             unique_data[item["id"]] = item
         retrieved_old_memory = list(unique_data.values())
         logger.info(f"Total existing memories: {len(retrieved_old_memory)}")
+        _context_for_synaptic = [{"id": item["id"], "text": item.get("text", "")} for item in retrieved_old_memory] if self._synaptic else None
         temp_uuid_mapping = {}
         for idx, item in enumerate(retrieved_old_memory):
             temp_uuid_mapping[str(idx)] = item["id"]
@@ -1632,6 +1654,15 @@ class AsyncMemory(MemoryBase):
         except Exception as e:
             logger.error(f"Error in memory processing loop (async): {e}")
 
+        if self._synaptic:
+            for mem in returned_memories:
+                if mem.get("event") in ("ADD", "UPDATE"):
+                    await self._synaptic.on_add(
+                        memory_id=mem["id"],
+                        content=mem["memory"],
+                        context_memories=_context_for_synaptic,
+                    )
+
         keys, encoded_ids = process_telemetry_filters(effective_filters)
         capture_event(
             "mem0.add",
@@ -1721,6 +1752,7 @@ class AsyncMemory(MemoryBase):
                    it might return a direct list (see deprecation warning).
                    Example for v1.1+: `{"results": [{"id": "...", "memory": "...", ...}]}`
         """
+        user_id = user_id or self.default_user_id
 
         _, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_filters=filters
@@ -1849,6 +1881,7 @@ class AsyncMemory(MemoryBase):
                   and potentially "relations" if graph store is enabled.
                   Example for v1.1+: `{"results": [{"id": "...", "memory": "...", "score": 0.8, ...}]}`
         """
+        user_id = user_id or self.default_user_id
 
         _, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_filters=filters
@@ -1905,6 +1938,9 @@ class AsyncMemory(MemoryBase):
                 original_memories = reranked_memories
             except Exception as e:
                 logger.warning(f"Reranking failed, using original results: {e}")
+
+        if self._synaptic and original_memories:
+            original_memories = await self._synaptic.on_search(query, original_memories)
 
         if self.enable_graph:
             return {"results": original_memories, "relations": graph_entities}
@@ -2090,6 +2126,7 @@ class AsyncMemory(MemoryBase):
             agent_id (str, optional): ID of the agent to delete memories for. Defaults to None.
             run_id (str, optional): ID of the run to delete memories for. Defaults to None.
         """
+        user_id = user_id or self.default_user_id
         filters = {}
         if user_id:
             filters["user_id"] = user_id
@@ -2119,6 +2156,11 @@ class AsyncMemory(MemoryBase):
             await asyncio.to_thread(self.graph.delete_all, filters)
 
         return {"message": "Memories deleted successfully!"}
+
+    async def close(self) -> None:
+        """Release resources including synaptic connections."""
+        if self._synaptic:
+            await self._synaptic.close()
 
     async def history(self, memory_id):
         """
